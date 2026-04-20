@@ -4,17 +4,14 @@ TEST MODE ENABLED - Ready to deploy
 """
 
 import os
-import json
 import sqlite3
 import logging
 import requests
 import hashlib
 import hmac
 import uuid
-import asyncio
 from datetime import datetime, timedelta
 from threading import Thread
-from time import sleep
 from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,7 +21,7 @@ from telegram.ext import (
 )
 from flask import Flask, request, jsonify
 
-# ==================== YOUR CONFIGURATION (PRE-FILLED) ====================
+# ==================== YOUR CONFIGURATION ====================
 TELEGRAM_TOKEN = "8787506916:AAFOhMjjI1DHUcWm1emTV_PxfhkUGl-KptA"
 CRYPTO_PAY_TOKEN = "570386:AAu1GlMLEl1JYOR4Atk7NKjlNdkNKVVVtl0"
 ADMIN_CHAT_ID = "6758546387"
@@ -80,27 +77,8 @@ def init_db():
             locked_rate REAL,
             invoice_id TEXT,
             status TEXT,
-            retry_count INTEGER DEFAULT 0,
             created_at TIMESTAMP,
-            rate_expires_at TIMESTAMP,
             completed_at TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS failed_transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT,
-            error_message TEXT,
-            provider_used TEXT,
-            created_at TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            date DATE PRIMARY KEY,
-            total_orders INTEGER DEFAULT 0,
-            total_volume_usdt REAL DEFAULT 0,
-            failed_orders INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -109,13 +87,12 @@ def init_db():
 
 def save_order(user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id):
     order_uuid = str(uuid.uuid4())
-    expires_at = datetime.now() + timedelta(seconds=RATE_LOCK_SECONDS)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO orders (order_uuid, user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id, status, created_at, rate_expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (order_uuid, user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id, "pending", datetime.now(), expires_at))
+        INSERT INTO orders (order_uuid, user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (order_uuid, user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id, "pending", datetime.now()))
     conn.commit()
     conn.close()
     return order_uuid
@@ -142,7 +119,6 @@ def get_order_by_invoice(invoice_id):
             "network": row[4],
             "amount_ngn": row[5],
             "amount_usdt": row[6],
-            "locked_rate": row[7],
             "status": row[9]
         }
     return None
@@ -216,15 +192,32 @@ def send_airtime(phone, network, amount_ngn):
             if data.get("status") == "success" or data.get("code") == "200":
                 return True, "Airtime sent"
             if attempt < MAX_RETRIES - 1:
+                from time import sleep
                 sleep(2 ** attempt)
         except Exception as e:
             logger.error(f"VTU attempt {attempt + 1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
+                from time import sleep
                 sleep(2 ** attempt)
     return False, "Delivery failed"
 
 # ==================== FLASK WEBHOOK ====================
 flask_app = Flask(__name__)
+
+def send_telegram_message(chat_id, text):
+    """Send Telegram message using direct API (no async)"""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.ok
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        return False
 
 @flask_app.route("/crypto-pay-webhook", methods=["POST"])
 def crypto_pay_webhook():
@@ -244,11 +237,9 @@ def crypto_pay_webhook():
                 success, message = send_airtime(order["phone"], order["network"], order["amount_ngn"])
                 if success:
                     update_order_status(order["order_uuid"], "completed")
-                    # Notify user
-                    app = Application.builder().token(TELEGRAM_TOKEN).build()
-                    await app.bot.send_message(
-                        chat_id=order["user_id"],
-                        text=f"✅ Airtime Delivered!\n₦{order['amount_ngn']:,.0f} sent to {order['phone']}\nNetwork: {order['network']}\n\nThank you for using LuxarPay! 🚀"
+                    send_telegram_message(
+                        order["user_id"],
+                        f"✅ Airtime Delivered!\n₦{order['amount_ngn']:,.0f} sent to {order['phone']}\nNetwork: {order['network']}\n\nThank you for using LuxarPay! 🚀"
                     )
                     logger.info(f"Order {order['order_uuid']} completed")
                 else:
@@ -372,8 +363,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     logger.info(f"Starting LuxarPay in {'TEST MODE' if TEST_MODE else 'PRODUCTION MODE'}")
-    logger.info(f"Bot token: {TELEGRAM_TOKEN[:10]}...")
-    logger.info(f"Webhook URL: {WEBHOOK_URL}")
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -397,7 +386,6 @@ def main():
     
     Thread(target=run_flask, daemon=True).start()
     
-    # Start the bot
     port = int(os.environ.get("PORT", 8080))
     webhook_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
     logger.info(f"Starting webhook on port {port}")
@@ -407,8 +395,7 @@ def main():
         listen="0.0.0.0",
         port=port,
         url_path=TELEGRAM_TOKEN,
-        webhook_url=webhook_url,
-        secret_token=None
+        webhook_url=webhook_url
     )
 
 if __name__ == "__main__":
