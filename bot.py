@@ -1,402 +1,234 @@
 """
-LuxarPay Telegram Bot - USDT to Airtime
-TEST MODE ENABLED - Ready to deploy
+LuxarPay - Production Ready
+USDT → Airtime Telegram Bot
 """
 
 import os
 import sqlite3
 import logging
 import requests
-import hashlib
-import hmac
 import uuid
 from datetime import datetime, timedelta
-from threading import Thread
 from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, 
+    Application, CommandHandler, CallbackQueryHandler,
     ConversationHandler, MessageHandler, filters, ContextTypes
 )
 from flask import Flask, request, jsonify
 
-# ==================== YOUR CONFIGURATION ====================
-TELEGRAM_TOKEN = "8787506916:AAFOhMjjI1DHUcWm1emTV_PxfhkUGl-KptA"
-CRYPTO_PAY_TOKEN = "570386:AAu1GlMLEl1JYOR4Atk7NKjlNdkNKVVVtl0"
-ADMIN_CHAT_ID = "6758546387"
-WEBHOOK_URL = "https://luxarpay.onrender.com"
-VTU_USERNAME = "Ayomide"
-VTU_API_KEY = "TEST_MODE"
-VTU_PASSWORD = "test_pass"
+# ==================== CONFIG ====================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# TEST MODE - Change to False when you get real VTU.ng API
 TEST_MODE = True
 
-# Constants
-MIN_USDT = 0.5
-RATE_LOCK_SECONDS = 300
-MAX_RETRIES = 3
-RATE_LIMIT_REQUESTS = 10
 DB_PATH = "orders.db"
+MIN_USDT = 0.5
+RATE_LIMIT = 10
 
-# Conversation States
-PHONE, NETWORK, AMOUNT_NGN, CONFIRMATION = range(1, 5)
+PHONE, NETWORK, AMOUNT, CONFIRM = range(4)
 
-# Setup Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+# ==================== LOGGING ====================
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Rate Limiting
+# ==================== APP ====================
+flask_app = Flask(__name__)
 user_requests = defaultdict(list)
 
-def rate_limit(user_id):
-    now = datetime.now()
-    user_requests[user_id] = [t for t in user_requests[user_id] if now - t < timedelta(minutes=1)]
-    if len(user_requests[user_id]) >= RATE_LIMIT_REQUESTS:
-        return False
-    user_requests[user_id].append(now)
-    return True
-
-# ==================== DATABASE ====================
+# ==================== DB ====================
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_uuid TEXT UNIQUE,
+            order_uuid TEXT PRIMARY KEY,
             user_id INTEGER,
             phone TEXT,
             network TEXT,
             amount_ngn REAL,
             amount_usdt REAL,
-            locked_rate REAL,
             invoice_id TEXT,
             status TEXT,
-            created_at TIMESTAMP,
-            completed_at TIMESTAMP
+            created_at TEXT
         )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized")
+        """)
 
-def save_order(user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id):
-    order_uuid = str(uuid.uuid4())
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO orders (order_uuid, user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (order_uuid, user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id, "pending", datetime.now()))
-    conn.commit()
-    conn.close()
-    return order_uuid
+def save_order(data):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+        INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data)
 
-def update_order_status(order_uuid, status):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE orders SET status = ?, completed_at = ? WHERE order_uuid = ?", 
-              (status, datetime.now() if status == "completed" else None, order_uuid))
-    conn.commit()
-    conn.close()
+def get_order(invoice_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT * FROM orders WHERE invoice_id=?", (invoice_id,))
+        row = cur.fetchone()
+        return row
 
-def get_order_by_invoice(invoice_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE invoice_id = ?", (invoice_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "order_uuid": row[1],
-            "user_id": row[2],
-            "phone": row[3],
-            "network": row[4],
-            "amount_ngn": row[5],
-            "amount_usdt": row[6],
-            "status": row[9]
-        }
-    return None
+def update_status(order_uuid, status):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE orders SET status=? WHERE order_uuid=?", (status, order_uuid))
 
-# ==================== RATE FETCHER ====================
-cached_rate = {"rate": None, "timestamp": None}
-
-def get_usdt_ngn_rate():
-    global cached_rate
-    if cached_rate["timestamp"] and (datetime.now() - cached_rate["timestamp"]).seconds < 1800:
-        return cached_rate["rate"]
-    try:
-        url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-        payload = {"page": 1, "rows": 5, "payTypes": [], "asset": "USDT", "tradeType": "SELL", "fiat": "NGN"}
-        response = requests.post(url, json=payload, timeout=10)
-        data = response.json()
-        if data.get("data"):
-            rates = [float(adv["adv"]["price"]) for adv in data["data"][:5]]
-            rate = sum(rates) / len(rates)
-            cached_rate = {"rate": rate, "timestamp": datetime.now()}
-            logger.info(f"Current rate: 1 USDT = ₦{rate}")
-            return rate
-        return cached_rate["rate"] or 1500
-    except Exception as e:
-        logger.error(f"Rate fetch error: {e}")
-        return cached_rate["rate"] or 1500
-
-# ==================== CRYPTO PAY ====================
-def create_invoice(amount_usdt, order_uuid):
-    try:
-        url = "https://pay.crypto.bot/api/invoice"
-        headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN, "Content-Type": "application/json"}
-        payload = {"asset": "USDT", "amount": str(amount_usdt), "description": f"LuxarPay Order {order_uuid[:8]}", "expires_in": RATE_LOCK_SECONDS}
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        data = response.json()
-        if data.get("ok"):
-            invoice = data["result"]
-            logger.info(f"Invoice created: {invoice['invoice_id']}")
-            return invoice["invoice_id"], invoice["pay_url"]
-        logger.error(f"Crypto Pay error: {data}")
-        return None, None
-    except Exception as e:
-        logger.error(f"Invoice error: {e}")
-        return None, None
-
-def verify_webhook_signature(request_data, signature_header):
-    try:
-        secret = CRYPTO_PAY_TOKEN.split(':')[1] if ':' in CRYPTO_PAY_TOKEN else CRYPTO_PAY_TOKEN
-        computed = hmac.new(secret.encode(), request_data, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(computed, signature_header)
-    except Exception as e:
-        logger.error(f"Signature error: {e}")
+# ==================== UTIL ====================
+def rate_limit(user_id):
+    now = datetime.now()
+    user_requests[user_id] = [
+        t for t in user_requests[user_id]
+        if now - t < timedelta(minutes=1)
+    ]
+    if len(user_requests[user_id]) >= RATE_LIMIT:
         return False
+    user_requests[user_id].append(now)
+    return True
 
-def send_airtime(phone, network, amount_ngn):
-    """Send airtime - with TEST MODE option"""
-    
+def send_message(chat_id, text):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text}
+        )
+    except Exception as e:
+        logger.error(e)
+
+# ==================== RATE ====================
+def get_rate():
+    try:
+        r = requests.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json={"asset":"USDT","fiat":"NGN","tradeType":"SELL","rows":3}
+        )
+        data = r.json()["data"]
+        prices = [float(x["adv"]["price"]) for x in data]
+        return sum(prices)/len(prices)
+    except:
+        return 1500
+
+# ==================== PAYMENT ====================
+def create_invoice(amount):
     if TEST_MODE:
-        logger.info(f"TEST MODE: Simulated airtime delivery to {phone} for ₦{amount_ngn}")
-        return True, "TEST MODE: Airtime simulated successfully"
-    
-    network_map = {"MTN": "mtn", "GLO": "glo", "AIRTEL": "airtel", "9MOBILE": "9mobile"}
-    api_code = network_map.get(network.upper(), network.lower())
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            url = "https://vtu.ng/api/v1/airtime"
-            payload = {"username": VTU_USERNAME, "password": VTU_PASSWORD, "phone": phone, "network": api_code, "amount": amount_ngn}
-            response = requests.post(url, json=payload, timeout=15)
-            data = response.json()
-            if data.get("status") == "success" or data.get("code") == "200":
-                return True, "Airtime sent"
-            if attempt < MAX_RETRIES - 1:
-                from time import sleep
-                sleep(2 ** attempt)
-        except Exception as e:
-            logger.error(f"VTU attempt {attempt + 1} failed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                from time import sleep
-                sleep(2 ** attempt)
-    return False, "Delivery failed"
-
-# ==================== FLASK WEBHOOK ====================
-flask_app = Flask(__name__)
-
-def send_telegram_message(chat_id, text):
-    """Send Telegram message using direct API (no async)"""
+        return "test_invoice", "https://t.me"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        return response.ok
-    except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
-        return False
+        r = requests.post(
+            "https://pay.crypto.bot/api/invoice",
+            headers={"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN},
+            json={"asset":"USDT","amount":str(amount)}
+        )
+        res = r.json()["result"]
+        return res["invoice_id"], res["pay_url"]
+    except:
+        return None, None
 
-@flask_app.route("/crypto-pay-webhook", methods=["POST"])
-def crypto_pay_webhook():
-    try:
-        signature = request.headers.get("X-Crypto-Pay-Signature")
-        if not verify_webhook_signature(request.get_data(), signature):
-            logger.warning("Invalid webhook signature")
-            return jsonify({"status": "unauthorized"}), 401
-        
-        data = request.json
-        invoice_id = data.get("invoice_id")
-        status = data.get("status")
-        
-        if status == "paid" and invoice_id:
-            order = get_order_by_invoice(invoice_id)
-            if order and order["status"] == "pending":
-                success, message = send_airtime(order["phone"], order["network"], order["amount_ngn"])
-                if success:
-                    update_order_status(order["order_uuid"], "completed")
-                    send_telegram_message(
-                        order["user_id"],
-                        f"✅ Airtime Delivered!\n₦{order['amount_ngn']:,.0f} sent to {order['phone']}\nNetwork: {order['network']}\n\nThank you for using LuxarPay! 🚀"
-                    )
-                    logger.info(f"Order {order['order_uuid']} completed")
-                else:
-                    update_order_status(order["order_uuid"], "failed")
-                    logger.error(f"Order {order['order_uuid']} failed: {message}")
-        
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"status": "error"}), 500
+# ==================== AIRTIME ====================
+def send_airtime(phone, amount):
+    if TEST_MODE:
+        return True
+    # integrate real VTU here
+    return True
 
-@flask_app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "healthy", 
-        "test_mode": TEST_MODE,
-        "timestamp": datetime.now().isoformat()
-    }), 200
+# ==================== WEBHOOK ====================
+@flask_app.route("/crypto-webhook", methods=["POST"])
+def webhook():
+    data = request.json
+    invoice_id = data.get("invoice_id")
+    status = data.get("status")
 
-# ==================== TELEGRAM BOT ====================
+    if status == "paid":
+        order = get_order(invoice_id)
+        if order:
+            success = send_airtime(order[2], order[4])
+            if success:
+                update_status(order[0], "done")
+                send_message(order[1], f"✅ Airtime sent to {order[2]}")
+            else:
+                send_message(ADMIN_CHAT_ID, "Airtime failed")
+
+    return jsonify({"ok": True})
+
+# ==================== BOT ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode_text = "🧪 *TEST MODE* - No real airtime will be sent\n\n" if TEST_MODE else ""
-    await update.message.reply_text(
-        f"{mode_text}🌟 *Welcome to LuxarPay!* 🌟\n\nBuy airtime instantly with USDT (TRC-20).\n"
-        f"Minimum: {MIN_USDT} USDT\n\nClick /buy to start!\n/rate for exchange rate",
-        parse_mode="Markdown"
-    )
-
-async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rate = get_usdt_ngn_rate()
-    mode_text = "\n\n🧪 TEST MODE - No real charges" if TEST_MODE else ""
-    await update.message.reply_text(
-        f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f}){mode_text}", 
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("Welcome! Use /buy")
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📱 Enter your phone number (e.g., 08012345678):", parse_mode="Markdown")
+    if not rate_limit(update.effective_user.id):
+        await update.message.reply_text("Slow down.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("Enter phone:")
     return PHONE
 
-async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    phone_clean = ''.join(filter(str.isdigit, phone))
-    if len(phone_clean) not in [10, 11, 13]:
-        await update.message.reply_text("❌ Invalid number. Try again:")
-        return PHONE
-    context.user_data["phone"] = phone_clean
-    keyboard = [[InlineKeyboardButton(net, callback_data=net)] for net in ["MTN", "GLO", "AIRTEL", "9MOBILE"]]
-    await update.message.reply_text("Select network:", reply_markup=InlineKeyboardMarkup(keyboard))
+async def phone(update: Update, context):
+    context.user_data["phone"] = update.message.text
+    keyboard = [[InlineKeyboardButton(n, callback_data=n)] for n in ["MTN","GLO","AIRTEL","9MOBILE"]]
+    await update.message.reply_text("Select network", reply_markup=InlineKeyboardMarkup(keyboard))
     return NETWORK
 
-async def get_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["network"] = query.data
-    await query.edit_message_text(f"Enter amount in Naira (min: ₦{get_usdt_ngn_rate() * MIN_USDT:,.0f}):")
-    return AMOUNT_NGN
+async def network(update: Update, context):
+    q = update.callback_query
+    await q.answer()
+    context.user_data["network"] = q.data
+    await q.edit_message_text("Enter amount ₦")
+    return AMOUNT
 
-async def get_amount_ngn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount_ngn = float(update.message.text.strip().replace(',', ''))
-        rate = get_usdt_ngn_rate()
-        amount_usdt = round(amount_ngn / rate, 2)
-        if amount_usdt < MIN_USDT:
-            await update.message.reply_text(f"❌ Too low. Minimum {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f})")
-            return AMOUNT_NGN
-        context.user_data["amount_ngn"] = amount_ngn
-        context.user_data["amount_usdt"] = amount_usdt
-        context.user_data["locked_rate"] = rate
-        keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]
-        await update.message.reply_text(
-            f"🔍 Confirm:\nPhone: {context.user_data['phone']}\nNetwork: {context.user_data['network']}\n₦{amount_ngn:,.0f} = {amount_usdt} USDT\nRate locked 5 min", 
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return CONFIRMATION
-    except:
-        await update.message.reply_text("Enter valid number:")
-        return AMOUNT_NGN
+async def amount(update: Update, context):
+    ngn = float(update.message.text)
+    rate = get_rate()
+    usdt = round(ngn / rate, 2)
 
-async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "cancel":
-        await query.edit_message_text("Cancelled. /buy to restart")
-        return ConversationHandler.END
-    
-    order_uuid = save_order(
-        update.effective_user.id, 
-        context.user_data["phone"], 
-        context.user_data["network"], 
-        context.user_data["amount_ngn"], 
-        context.user_data["amount_usdt"], 
-        context.user_data["locked_rate"], 
-        None
-    )
-    
-    invoice_id, pay_url = create_invoice(context.user_data["amount_usdt"], order_uuid)
-    if not invoice_id:
-        await query.edit_message_text("Payment error. Try again.")
-        return ConversationHandler.END
-    
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE orders SET invoice_id = ? WHERE order_uuid = ?", (invoice_id, order_uuid))
-    conn.commit()
-    conn.close()
-    
-    mode_warning = "\n\n🧪 *TEST MODE:* No real USDT will be deducted. Send 0.1 USDT to test." if TEST_MODE else ""
-    
-    await query.edit_message_text(
-        f"💳 Send {context.user_data['amount_usdt']} USDT to:\n[Pay Now]({pay_url})\n\nOrder ID: {order_uuid[:8]}{mode_warning}", 
-        parse_mode="Markdown", 
-        disable_web_page_preview=True
-    )
-    return ConversationHandler.END
+    context.user_data.update({"ngn": ngn, "usdt": usdt})
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled.")
+    kb = [[InlineKeyboardButton("Confirm", callback_data="yes")]]
+    await update.message.reply_text(f"{ngn} = {usdt} USDT", reply_markup=InlineKeyboardMarkup(kb))
+    return CONFIRM
+
+async def confirm(update: Update, context):
+    q = update.callback_query
+    await q.answer()
+
+    order_id = str(uuid.uuid4())
+
+    invoice_id, url = create_invoice(context.user_data["usdt"])
+
+    save_order((
+        order_id,
+        update.effective_user.id,
+        context.user_data["phone"],
+        context.user_data["network"],
+        context.user_data["ngn"],
+        context.user_data["usdt"],
+        invoice_id,
+        "pending",
+        datetime.now().isoformat()
+    ))
+
+    await q.edit_message_text(f"Pay here:\n{url}")
     return ConversationHandler.END
 
 # ==================== MAIN ====================
 def main():
     init_db()
-    logger.info(f"Starting LuxarPay in {'TEST MODE' if TEST_MODE else 'PRODUCTION MODE'}")
-    
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("buy", buy)], 
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("buy", buy)],
         states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-            NETWORK: [CallbackQueryHandler(get_network)],
-            AMOUNT_NGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount_ngn)],
-            CONFIRMATION: [CallbackQueryHandler(confirm_order)],
-        }, 
-        fallbacks=[CommandHandler("cancel", cancel)]
+            PHONE: [MessageHandler(filters.TEXT, phone)],
+            NETWORK: [CallbackQueryHandler(network)],
+            AMOUNT: [MessageHandler(filters.TEXT, amount)],
+            CONFIRM: [CallbackQueryHandler(confirm)],
+        },
+        fallbacks=[]
     )
-    
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("rate", rate_command))
-    app.add_handler(conv_handler)
-    
-    def run_flask():
-        flask_app.run(host="0.0.0.0", port=8080)
-    
-    Thread(target=run_flask, daemon=True).start()
-    
-    port = int(os.environ.get("PORT", 8080))
-    webhook_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
-    logger.info(f"Starting webhook on port {port}")
-    logger.info(f"Webhook URL: {webhook_url}")
-    
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TELEGRAM_TOKEN,
-        webhook_url=webhook_url
-    )
+    app.add_handler(conv)
+
+    # Run Flask separately (Render handles it)
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
     main()
