@@ -244,12 +244,15 @@ def crypto_pay_webhook():
                 success, message = send_airtime(order["phone"], order["network"], order["amount_ngn"])
                 if success:
                     update_order_status(order["order_uuid"], "completed")
-                    # Notify user
-                    app = Application.builder().token(TELEGRAM_TOKEN).build()
-                    await app.bot.send_message(
-                        chat_id=order["user_id"],
-                        text=f"✅ Airtime Delivered!\n₦{order['amount_ngn']:,.0f} sent to {order['phone']}\nNetwork: {order['network']}\n\nThank you for using LuxarPay! 🚀"
-                    )
+                    
+                    # FIXED: Proper async notification
+                    async def send_notification():
+                        app = Application.builder().token(TELEGRAM_TOKEN).build()
+                        await app.bot.send_message(
+                            chat_id=order["user_id"],
+                            text=f"✅ Airtime Delivered!\n₦{order['amount_ngn']:,.0f} sent to {order['phone']}\nNetwork: {order['network']}\n\nThank you for using LuxarPay! 🚀"
+                        )
+                    asyncio.run(send_notification())
                     logger.info(f"Order {order['order_uuid']} completed")
                 else:
                     update_order_status(order["order_uuid"], "failed")
@@ -259,15 +262,6 @@ def crypto_pay_webhook():
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return jsonify({"status": "error"}), 500
-
-@flask_app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "healthy", 
-        "test_mode": TEST_MODE,
-        "timestamp": datetime.now().isoformat()
-    }), 200
-
 # ==================== TELEGRAM BOT ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_text = "🧪 *TEST MODE* - No real airtime will be sent\n\n" if TEST_MODE else ""
