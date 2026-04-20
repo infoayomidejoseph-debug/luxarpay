@@ -1,7 +1,6 @@
- 
 """
 LuxarPay Telegram Bot - USDT to Airtime
-PRODUCTION READY - Copy this entire file
+TEST MODE ENABLED - No VTU.ng funding required yet
 """
 
 import os
@@ -26,13 +25,16 @@ from telegram.ext import (
 from flask import Flask, request, jsonify
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
-VTU_API_KEY = os.getenv("VTU_API_KEY")
-VTU_USERNAME = os.getenv("VTU_USERNAME")
-VTU_PASSWORD = os.getenv("VTU_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("8685329100:AAF9BIUsSWuO9wTZAmB1WVozOoBVXnoDQkc")
+CRYPTO_PAY_TOKEN = os.getenv("570386:AAu1GlMLEl1JYOR4Atk7NKjlNdkNKVVVtl0")
+VTU_API_KEY = os.getenv("VTU_API_KEY", "TEST_MODE")
+VTU_USERNAME = os.getenv("VTU_USERNAME", "test_user")
+VTU_PASSWORD = os.getenv("VTU_PASSWORD", "test_pass")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+
+# TEST MODE - Set to False when you get real VTU.ng API
+TEST_MODE = True  # ← Change to False when VTU.ng is funded
 
 # Constants
 MIN_USDT = 0.5
@@ -188,8 +190,17 @@ def verify_webhook_signature(request_data, signature_header):
         return False
 
 def send_airtime(phone, network, amount_ngn):
+    """Send airtime - with TEST MODE option"""
+    
+    # TEST MODE: Simulate successful delivery
+    if TEST_MODE:
+        logger.info(f"TEST MODE: Simulated airtime delivery to {phone} for ₦{amount_ngn}")
+        return True, "TEST MODE: Airtime simulated successfully"
+    
+    # REAL MODE: Call VTU.ng API
     network_map = {"MTN": "mtn", "GLO": "glo", "AIRTEL": "airtel", "9MOBILE": "9mobile"}
     api_code = network_map.get(network.upper(), network.lower())
+    
     for attempt in range(MAX_RETRIES):
         try:
             url = "https://vtu.ng/api/v1/airtime"
@@ -237,19 +248,25 @@ def crypto_pay_webhook():
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+    return jsonify({
+        "status": "healthy", 
+        "test_mode": TEST_MODE,
+        "timestamp": datetime.now().isoformat()
+    }), 200
 
 # ==================== TELEGRAM BOT ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode_text = "🧪 *TEST MODE* - No real airtime will be sent\n\n" if TEST_MODE else ""
     await update.message.reply_text(
-        "🌟 *Welcome to LuxarPay!* 🌟\n\nBuy airtime instantly with USDT (TRC-20).\n"
+        f"{mode_text}🌟 *Welcome to LuxarPay!* 🌟\n\nBuy airtime instantly with USDT (TRC-20).\n"
         f"Minimum: {MIN_USDT} USDT\n\nClick /buy to start!\n/rate for exchange rate",
         parse_mode="Markdown"
     )
 
 async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rate = get_usdt_ngn_rate()
-    await update.message.reply_text(f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f})", parse_mode="Markdown")
+    mode_text = "\n\n🧪 TEST MODE - No real charges" if TEST_MODE else ""
+    await update.message.reply_text(f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f}){mode_text}", parse_mode="Markdown")
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📱 Enter your phone number (e.g., 08012345678):", parse_mode="Markdown")
@@ -307,7 +324,10 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.execute("UPDATE orders SET invoice_id = ? WHERE order_uuid = ?", (invoice_id, order_uuid))
     conn.commit()
     conn.close()
-    await query.edit_message_text(f"💳 Send {context.user_data['amount_usdt']} USDT to:\n[Pay Now]({pay_url})\n\nOrder ID: {order_uuid[:8]}", parse_mode="Markdown", disable_web_page_preview=True)
+    
+    mode_warning = "\n\n🧪 *TEST MODE:* No real USDT will be deducted. Send 0.1 USDT to test." if TEST_MODE else ""
+    
+    await query.edit_message_text(f"💳 Send {context.user_data['amount_usdt']} USDT to:\n[Pay Now]({pay_url})\n\nOrder ID: {order_uuid[:8]}{mode_warning}", parse_mode="Markdown", disable_web_page_preview=True)
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +338,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global app
     init_db()
+    logger.info(f"Starting LuxarPay in {'TEST MODE' if TEST_MODE else 'PRODUCTION MODE'}")
+    
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     conv_handler = ConversationHandler(entry_points=[CommandHandler("buy", buy)], states={
         PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
