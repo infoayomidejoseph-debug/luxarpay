@@ -1,6 +1,6 @@
 """
 LuxarPay Telegram Bot - USDT to Airtime
-TEST MODE ENABLED - No VTU.ng funding required yet
+TEST MODE ENABLED - Ready to deploy
 """
 
 import os
@@ -24,17 +24,17 @@ from telegram.ext import (
 )
 from flask import Flask, request, jsonify
 
-# ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = os.getenv("8685329100:AAF9BIUsSWuO9wTZAmB1WVozOoBVXnoDQkc")
-CRYPTO_PAY_TOKEN = os.getenv("570386:AAu1GlMLEl1JYOR4Atk7NKjlNdkNKVVVtl0")
-VTU_API_KEY = os.getenv("VTU_API_KEY", "TEST_MODE")
-VTU_USERNAME = os.getenv("VTU_USERNAME", "test_user")
-VTU_PASSWORD = os.getenv("VTU_PASSWORD", "test_pass")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+# ==================== YOUR CONFIGURATION (PRE-FILLED) ====================
+TELEGRAM_TOKEN = "8787506916:AAFOhMjjI1DHUcWm1emTV_PxfhkUGl-KptA"
+CRYPTO_PAY_TOKEN = "570386:AAu1GlMLEl1JYOR4Atk7NKjlNdkNKVVVtl0"
+ADMIN_CHAT_ID = "6758546387"
+WEBHOOK_URL = "https://luxarpay.onrender.com"
+VTU_USERNAME = "Ayomide"
+VTU_API_KEY = "TEST_MODE"
+VTU_PASSWORD = "test_pass"
 
-# TEST MODE - Set to False when you get real VTU.ng API
-TEST_MODE = True  # ← Change to False when VTU.ng is funded
+# TEST MODE - Change to False when you get real VTU.ng API
+TEST_MODE = True
 
 # Constants
 MIN_USDT = 0.5
@@ -105,6 +105,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    logger.info("Database initialized")
 
 def save_order(user_id, phone, network, amount_ngn, amount_usdt, locked_rate, invoice_id):
     order_uuid = str(uuid.uuid4())
@@ -122,7 +123,8 @@ def save_order(user_id, phone, network, amount_ngn, amount_usdt, locked_rate, in
 def update_order_status(order_uuid, status):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE orders SET status = ?, completed_at = ? WHERE order_uuid = ?", (status, datetime.now() if status == "completed" else None, order_uuid))
+    c.execute("UPDATE orders SET status = ?, completed_at = ? WHERE order_uuid = ?", 
+              (status, datetime.now() if status == "completed" else None, order_uuid))
     conn.commit()
     conn.close()
 
@@ -161,9 +163,11 @@ def get_usdt_ngn_rate():
             rates = [float(adv["adv"]["price"]) for adv in data["data"][:5]]
             rate = sum(rates) / len(rates)
             cached_rate = {"rate": rate, "timestamp": datetime.now()}
+            logger.info(f"Current rate: 1 USDT = ₦{rate}")
             return rate
         return cached_rate["rate"] or 1500
-    except:
+    except Exception as e:
+        logger.error(f"Rate fetch error: {e}")
         return cached_rate["rate"] or 1500
 
 # ==================== CRYPTO PAY ====================
@@ -176,9 +180,12 @@ def create_invoice(amount_usdt, order_uuid):
         data = response.json()
         if data.get("ok"):
             invoice = data["result"]
+            logger.info(f"Invoice created: {invoice['invoice_id']}")
             return invoice["invoice_id"], invoice["pay_url"]
+        logger.error(f"Crypto Pay error: {data}")
         return None, None
-    except:
+    except Exception as e:
+        logger.error(f"Invoice error: {e}")
         return None, None
 
 def verify_webhook_signature(request_data, signature_header):
@@ -186,18 +193,17 @@ def verify_webhook_signature(request_data, signature_header):
         secret = CRYPTO_PAY_TOKEN.split(':')[1] if ':' in CRYPTO_PAY_TOKEN else CRYPTO_PAY_TOKEN
         computed = hmac.new(secret.encode(), request_data, hashlib.sha256).hexdigest()
         return hmac.compare_digest(computed, signature_header)
-    except:
+    except Exception as e:
+        logger.error(f"Signature error: {e}")
         return False
 
 def send_airtime(phone, network, amount_ngn):
     """Send airtime - with TEST MODE option"""
     
-    # TEST MODE: Simulate successful delivery
     if TEST_MODE:
         logger.info(f"TEST MODE: Simulated airtime delivery to {phone} for ₦{amount_ngn}")
         return True, "TEST MODE: Airtime simulated successfully"
     
-    # REAL MODE: Call VTU.ng API
     network_map = {"MTN": "mtn", "GLO": "glo", "AIRTEL": "airtel", "9MOBILE": "9mobile"}
     api_code = network_map.get(network.upper(), network.lower())
     
@@ -211,7 +217,8 @@ def send_airtime(phone, network, amount_ngn):
                 return True, "Airtime sent"
             if attempt < MAX_RETRIES - 1:
                 sleep(2 ** attempt)
-        except:
+        except Exception as e:
+            logger.error(f"VTU attempt {attempt + 1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
                 sleep(2 ** attempt)
     return False, "Delivery failed"
@@ -224,10 +231,13 @@ def crypto_pay_webhook():
     try:
         signature = request.headers.get("X-Crypto-Pay-Signature")
         if not verify_webhook_signature(request.get_data(), signature):
+            logger.warning("Invalid webhook signature")
             return jsonify({"status": "unauthorized"}), 401
+        
         data = request.json
         invoice_id = data.get("invoice_id")
         status = data.get("status")
+        
         if status == "paid" and invoice_id:
             order = get_order_by_invoice(invoice_id)
             if order and order["status"] == "pending":
@@ -236,14 +246,18 @@ def crypto_pay_webhook():
                     update_order_status(order["order_uuid"], "completed")
                     # Notify user
                     app = Application.builder().token(TELEGRAM_TOKEN).build()
-                    asyncio.run(app.bot.send_message(
+                    await app.bot.send_message(
                         chat_id=order["user_id"],
                         text=f"✅ Airtime Delivered!\n₦{order['amount_ngn']:,.0f} sent to {order['phone']}\nNetwork: {order['network']}\n\nThank you for using LuxarPay! 🚀"
-                    ))
+                    )
+                    logger.info(f"Order {order['order_uuid']} completed")
                 else:
                     update_order_status(order["order_uuid"], "failed")
+                    logger.error(f"Order {order['order_uuid']} failed: {message}")
+        
         return jsonify({"status": "ok"}), 200
-    except:
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
         return jsonify({"status": "error"}), 500
 
 @flask_app.route("/health", methods=["GET"])
@@ -266,7 +280,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rate = get_usdt_ngn_rate()
     mode_text = "\n\n🧪 TEST MODE - No real charges" if TEST_MODE else ""
-    await update.message.reply_text(f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f}){mode_text}", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f}){mode_text}", 
+        parse_mode="Markdown"
+    )
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📱 Enter your phone number (e.g., 08012345678):", parse_mode="Markdown")
@@ -302,7 +319,10 @@ async def get_amount_ngn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["amount_usdt"] = amount_usdt
         context.user_data["locked_rate"] = rate
         keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]
-        await update.message.reply_text(f"🔍 Confirm:\nPhone: {context.user_data['phone']}\nNetwork: {context.user_data['network']}\n₦{amount_ngn:,.0f} = {amount_usdt} USDT\nRate locked 5 min", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(
+            f"🔍 Confirm:\nPhone: {context.user_data['phone']}\nNetwork: {context.user_data['network']}\n₦{amount_ngn:,.0f} = {amount_usdt} USDT\nRate locked 5 min", 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return CONFIRMATION
     except:
         await update.message.reply_text("Enter valid number:")
@@ -314,12 +334,22 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "cancel":
         await query.edit_message_text("Cancelled. /buy to restart")
         return ConversationHandler.END
-    order_uuid = save_order(update.effective_user.id, context.user_data["phone"], context.user_data["network"], 
-                           context.user_data["amount_ngn"], context.user_data["amount_usdt"], context.user_data["locked_rate"], None)
+    
+    order_uuid = save_order(
+        update.effective_user.id, 
+        context.user_data["phone"], 
+        context.user_data["network"], 
+        context.user_data["amount_ngn"], 
+        context.user_data["amount_usdt"], 
+        context.user_data["locked_rate"], 
+        None
+    )
+    
     invoice_id, pay_url = create_invoice(context.user_data["amount_usdt"], order_uuid)
     if not invoice_id:
         await query.edit_message_text("Payment error. Try again.")
         return ConversationHandler.END
+    
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE orders SET invoice_id = ? WHERE order_uuid = ?", (invoice_id, order_uuid))
     conn.commit()
@@ -327,7 +357,11 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     mode_warning = "\n\n🧪 *TEST MODE:* No real USDT will be deducted. Send 0.1 USDT to test." if TEST_MODE else ""
     
-    await query.edit_message_text(f"💳 Send {context.user_data['amount_usdt']} USDT to:\n[Pay Now]({pay_url})\n\nOrder ID: {order_uuid[:8]}{mode_warning}", parse_mode="Markdown", disable_web_page_preview=True)
+    await query.edit_message_text(
+        f"💳 Send {context.user_data['amount_usdt']} USDT to:\n[Pay Now]({pay_url})\n\nOrder ID: {order_uuid[:8]}{mode_warning}", 
+        parse_mode="Markdown", 
+        disable_web_page_preview=True
+    )
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,30 +370,46 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== MAIN ====================
 def main():
-    global app
     init_db()
     logger.info(f"Starting LuxarPay in {'TEST MODE' if TEST_MODE else 'PRODUCTION MODE'}")
+    logger.info(f"Bot token: {TELEGRAM_TOKEN[:10]}...")
+    logger.info(f"Webhook URL: {WEBHOOK_URL}")
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    conv_handler = ConversationHandler(entry_points=[CommandHandler("buy", buy)], states={
-        PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-        NETWORK: [CallbackQueryHandler(get_network)],
-        AMOUNT_NGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount_ngn)],
-        CONFIRMATION: [CallbackQueryHandler(confirm_order)],
-    }, fallbacks=[CommandHandler("cancel", cancel)])
+    
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("buy", buy)], 
+        states={
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+            NETWORK: [CallbackQueryHandler(get_network)],
+            AMOUNT_NGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount_ngn)],
+            CONFIRMATION: [CallbackQueryHandler(confirm_order)],
+        }, 
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rate", rate_command))
     app.add_handler(conv_handler)
     
     def run_flask():
-        flask_app.run(host="0.0.0.0", port=5000)
+        flask_app.run(host="0.0.0.0", port=8080)
+    
     Thread(target=run_flask, daemon=True).start()
     
-    if os.getenv("ENV") == "production":
-        port = int(os.environ.get("PORT", 8080))
-        app.run_webhook(listen="0.0.0.0", port=port, url_path=TELEGRAM_TOKEN, webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
-    else:
-        app.run_polling()
+    # Start the bot
+    port = int(os.environ.get("PORT", 8080))
+    webhook_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+    logger.info(f"Starting webhook on port {port}")
+    logger.info(f"Webhook URL: {webhook_url}")
+    
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TELEGRAM_TOKEN,
+        webhook_url=webhook_url,
+        secret_token=None
+    )
 
 if __name__ == "__main__":
     main()
