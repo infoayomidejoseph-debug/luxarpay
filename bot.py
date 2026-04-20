@@ -192,10 +192,12 @@ def send_airtime(phone, network, amount_ngn):
             if data.get("status") == "success" or data.get("code") == "200":
                 return True, "Airtime sent"
             if attempt < MAX_RETRIES - 1:
+                from time import sleep
                 sleep(2 ** attempt)
         except Exception as e:
             logger.error(f"VTU attempt {attempt + 1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
+                from time import sleep
                 sleep(2 ** attempt)
     return False, "Delivery failed"
 
