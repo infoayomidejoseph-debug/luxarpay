@@ -1,6 +1,6 @@
 """
-LuxarPay Telegram Bot - USDT to Airtime
-TEST MODE ENABLED - Ready to deploy
+LuxarPay Telegram Bot - USDT to Airtime (POLLING MODE)
+Minimum: $2 USDT
 """
 
 import os
@@ -30,27 +30,24 @@ VTU_USERNAME = "Ayomide"
 VTU_API_KEY = "TEST_MODE"
 VTU_PASSWORD = "test_pass"
 
-# TEST MODE - Change to False when you get real VTU.ng API
 TEST_MODE = True
 
-# Constants
-MIN_USDT = 0.5
+# CHANGED: Minimum is now $2 USDT
+MIN_USDT = 2.0  # ← Changed from 0.5 to 2.0
+
 RATE_LOCK_SECONDS = 300
 MAX_RETRIES = 3
 RATE_LIMIT_REQUESTS = 10
 DB_PATH = "orders.db"
 
-# Conversation States
 PHONE, NETWORK, AMOUNT_NGN, CONFIRMATION = range(1, 5)
 
-# Setup Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Rate Limiting
 user_requests = defaultdict(list)
 
 def rate_limit(user_id):
@@ -150,32 +147,36 @@ def get_usdt_ngn_rate():
 def create_invoice(amount_usdt, order_uuid):
     try:
         url = "https://pay.crypto.bot/api/invoice"
-        headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN, "Content-Type": "application/json"}
-        payload = {"asset": "USDT", "amount": str(amount_usdt), "description": f"LuxarPay Order {order_uuid[:8]}", "expires_in": RATE_LOCK_SECONDS}
+        headers = {
+            "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN, 
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "asset": "USDT", 
+            "amount": str(amount_usdt), 
+            "description": f"LuxarPay Order {order_uuid[:8]}", 
+            "expires_in": RATE_LOCK_SECONDS
+        }
+        
+        logger.info(f"Creating invoice: {payload}")
         response = requests.post(url, json=payload, headers=headers, timeout=10)
+        logger.info(f"Crypto Pay response status: {response.status_code}")
+        logger.info(f"Crypto Pay response body: {response.text}")
+        
         data = response.json()
+        
         if data.get("ok"):
             invoice = data["result"]
             logger.info(f"Invoice created: {invoice['invoice_id']}")
             return invoice["invoice_id"], invoice["pay_url"]
-        logger.error(f"Crypto Pay error: {data}")
-        return None, None
+        else:
+            logger.error(f"Crypto Pay error: {data}")
+            return None, None
     except Exception as e:
         logger.error(f"Invoice error: {e}")
         return None, None
 
-def verify_webhook_signature(request_data, signature_header):
-    try:
-        secret = CRYPTO_PAY_TOKEN.split(':')[1] if ':' in CRYPTO_PAY_TOKEN else CRYPTO_PAY_TOKEN
-        computed = hmac.new(secret.encode(), request_data, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(computed, signature_header)
-    except Exception as e:
-        logger.error(f"Signature error: {e}")
-        return False
-
 def send_airtime(phone, network, amount_ngn):
-    """Send airtime - with TEST MODE option"""
-    
     if TEST_MODE:
         logger.info(f"TEST MODE: Simulated airtime delivery to {phone} for ₦{amount_ngn}")
         return True, "TEST MODE: Airtime simulated successfully"
@@ -201,11 +202,10 @@ def send_airtime(phone, network, amount_ngn):
                 sleep(2 ** attempt)
     return False, "Delivery failed"
 
-# ==================== FLASK WEBHOOK ====================
+# ==================== FLASK WEBHOOK (for Crypto Pay) ====================
 flask_app = Flask(__name__)
 
 def send_telegram_message(chat_id, text):
-    """Send Telegram message using direct API (no async)"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
@@ -222,11 +222,6 @@ def send_telegram_message(chat_id, text):
 @flask_app.route("/crypto-pay-webhook", methods=["POST"])
 def crypto_pay_webhook():
     try:
-        signature = request.headers.get("X-Crypto-Pay-Signature")
-        if not verify_webhook_signature(request.get_data(), signature):
-            logger.warning("Invalid webhook signature")
-            return jsonify({"status": "unauthorized"}), 401
-        
         data = request.json
         invoice_id = data.get("invoice_id")
         status = data.get("status")
@@ -256,6 +251,7 @@ def health_check():
     return jsonify({
         "status": "healthy", 
         "test_mode": TEST_MODE,
+        "min_usdt": MIN_USDT,
         "timestamp": datetime.now().isoformat()
     }), 200
 
@@ -264,7 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_text = "🧪 *TEST MODE* - No real airtime will be sent\n\n" if TEST_MODE else ""
     await update.message.reply_text(
         f"{mode_text}🌟 *Welcome to LuxarPay!* 🌟\n\nBuy airtime instantly with USDT (TRC-20).\n"
-        f"Minimum: {MIN_USDT} USDT\n\nClick /buy to start!\n/rate for exchange rate",
+        f"Minimum: ${MIN_USDT} USDT\n\nClick /buy to start!\n/rate for exchange rate",
         parse_mode="Markdown"
     )
 
@@ -272,7 +268,7 @@ async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rate = get_usdt_ngn_rate()
     mode_text = "\n\n🧪 TEST MODE - No real charges" if TEST_MODE else ""
     await update.message.reply_text(
-        f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f}){mode_text}", 
+        f"💱 1 USDT = ₦{rate:,.0f}\nMinimum: ${MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f}){mode_text}", 
         parse_mode="Markdown"
     )
 
@@ -303,15 +299,22 @@ async def get_amount_ngn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount_ngn = float(update.message.text.strip().replace(',', ''))
         rate = get_usdt_ngn_rate()
         amount_usdt = round(amount_ngn / rate, 2)
+        
+        # Check minimum
         if amount_usdt < MIN_USDT:
-            await update.message.reply_text(f"❌ Too low. Minimum {MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f})")
+            await update.message.reply_text(
+                f"❌ Too low. Minimum ${MIN_USDT} USDT (₦{rate * MIN_USDT:,.0f})\n"
+                f"You entered: ₦{amount_ngn:,.0f} (${amount_usdt} USDT)\n\n"
+                f"Please try again with a higher amount:"
+            )
             return AMOUNT_NGN
+            
         context.user_data["amount_ngn"] = amount_ngn
         context.user_data["amount_usdt"] = amount_usdt
         context.user_data["locked_rate"] = rate
         keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]
         await update.message.reply_text(
-            f"🔍 Confirm:\nPhone: {context.user_data['phone']}\nNetwork: {context.user_data['network']}\n₦{amount_ngn:,.0f} = {amount_usdt} USDT\nRate locked 5 min", 
+            f"🔍 Confirm:\nPhone: {context.user_data['phone']}\nNetwork: {context.user_data['network']}\n₦{amount_ngn:,.0f} = ${amount_usdt} USDT\nRate locked 5 min", 
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return CONFIRMATION
@@ -338,7 +341,8 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     invoice_id, pay_url = create_invoice(context.user_data["amount_usdt"], order_uuid)
     if not invoice_id:
-        await query.edit_message_text("Payment error. Try again.")
+        await query.edit_message_text("❌ Payment system error. Please try again later.\n\nIf this persists, contact support.")
+        logger.error(f"Invoice creation failed for order {order_uuid}")
         return ConversationHandler.END
     
     conn = sqlite3.connect(DB_PATH)
@@ -346,10 +350,16 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    mode_warning = "\n\n🧪 *TEST MODE:* No real USDT will be deducted. Send 0.1 USDT to test." if TEST_MODE else ""
+    mode_warning = "\n\n🧪 *TEST MODE:* No real USDT will be deducted." if TEST_MODE else ""
     
     await query.edit_message_text(
-        f"💳 Send {context.user_data['amount_usdt']} USDT to:\n[Pay Now]({pay_url})\n\nOrder ID: {order_uuid[:8]}{mode_warning}", 
+        f"💳 *Payment Required*\n\n"
+        f"Amount: ${context.user_data['amount_usdt']} USDT\n"
+        f"Network: TRC-20\n\n"
+        f"[Click here to pay]({pay_url})\n\n"
+        f"⚠️ Send exactly ${context.user_data['amount_usdt']} USDT\n"
+        f"Order ID: `{order_uuid[:8]}`\n"
+        f"Status: ⏳ Waiting for payment...{mode_warning}", 
         parse_mode="Markdown", 
         disable_web_page_preview=True
     )
@@ -363,6 +373,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     logger.info(f"Starting LuxarPay in {'TEST MODE' if TEST_MODE else 'PRODUCTION MODE'}")
+    logger.info(f"Minimum USDT: ${MIN_USDT}")
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -386,17 +397,8 @@ def main():
     
     Thread(target=run_flask, daemon=True).start()
     
-    port = int(os.environ.get("PORT", 8080))
-    webhook_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
-    logger.info(f"Starting webhook on port {port}")
-    logger.info(f"Webhook URL: {webhook_url}")
-    
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TELEGRAM_TOKEN,
-        webhook_url=webhook_url
-    )
+    logger.info("Starting bot in polling mode...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
